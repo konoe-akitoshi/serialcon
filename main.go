@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,9 +23,9 @@ import (
 
 // エンコーディング種類
 var encodings = map[string]encoding.Encoding{
-	"UTF-8":    encoding.Nop,
-	"Shift-JIS": japanese.ShiftJIS,
-	"EUC-JP":   japanese.EUCJP,
+	"UTF-8":       encoding.Nop,
+	"Shift-JIS":   japanese.ShiftJIS,
+	"EUC-JP":      japanese.EUCJP,
 	"ISO-2022-JP": japanese.ISO2022JP,
 }
 
@@ -32,22 +34,23 @@ var commonBaudRates = []int{9600, 19200, 38400, 57600, 115200}
 
 // シリアルポート設定
 type SerialConfig struct {
-	PortName             string
-	BaudRate             int
-	DataBits             int
-	Parity               serial.Parity
-	StopBits             serial.StopBits
-	AutoNegotiate        bool
-	AutoDetectEncoding   bool
-	Encoding             encoding.Encoding
-	EncodingName         string
+	PortName           string
+	BaudRate           int
+	DataBits           int
+	Parity             serial.Parity
+	StopBits           serial.StopBits
+	AutoNegotiate      bool
+	AutoDetectEncoding bool
+	Encoding           encoding.Encoding
+	EncodingName       string
+	LogFile            string // ログファイルのパス
 }
 
 // デフォルト設定
 func DefaultConfig() SerialConfig {
 	return SerialConfig{
 		PortName:           "",
-		BaudRate:           9600,     // Ciscoデバイスのデフォルト
+		BaudRate:           9600, // Ciscoデバイスのデフォルト
 		DataBits:           8,
 		Parity:             serial.NoParity,
 		StopBits:           serial.OneStopBit,
@@ -55,6 +58,7 @@ func DefaultConfig() SerialConfig {
 		AutoDetectEncoding: true,
 		Encoding:           encoding.Nop, // デフォルトはUTF-8
 		EncodingName:       "UTF-8",
+		LogFile:            "", // デフォルトはログなし
 	}
 }
 
@@ -90,43 +94,43 @@ func extractPortName(portInfo string) string {
 func detectEncoding(data []byte) (encoding.Encoding, string) {
 	// 各エンコーディングでデコードを試みて、最も「正しく」見えるものを選択
 	// 簡易的な判定: デコード後のUTF-8文字列に不正なバイトシーケンスが少ないものを選択
-	
+
 	bestEncoding := encoding.Nop
 	bestEncodingName := "UTF-8"
 	lowestErrorCount := len(data) // 最大エラー数で初期化
-	
+
 	// 試すエンコーディング
 	encodingsToTry := map[string]encoding.Encoding{
-		"Shift-JIS": japanese.ShiftJIS,
-		"EUC-JP":    japanese.EUCJP,
+		"Shift-JIS":   japanese.ShiftJIS,
+		"EUC-JP":      japanese.EUCJP,
 		"ISO-2022-JP": japanese.ISO2022JP,
 	}
-	
+
 	for name, enc := range encodingsToTry {
 		decoder := enc.NewDecoder()
 		decoded, _, err := transform.Bytes(decoder, data)
 		if err != nil {
 			continue
 		}
-		
+
 		// UTF-8として不正なバイトシーケンスをカウント
 		errorCount := 0
 		for i := 0; i < len(decoded); i++ {
 			if decoded[i] >= 0x80 {
 				// マルチバイト文字の先頭バイト
-				if i+1 >= len(decoded) || (decoded[i+1] & 0xC0) != 0x80 {
+				if i+1 >= len(decoded) || (decoded[i+1]&0xC0) != 0x80 {
 					errorCount++
 				}
 			}
 		}
-		
+
 		if errorCount < lowestErrorCount {
 			lowestErrorCount = errorCount
 			bestEncoding = enc
 			bestEncodingName = name
 		}
 	}
-	
+
 	return bestEncoding, bestEncodingName
 }
 
@@ -134,10 +138,10 @@ func detectEncoding(data []byte) (encoding.Encoding, string) {
 func autoNegotiate(portName string, originalConfig SerialConfig) (SerialConfig, error) {
 	config := originalConfig
 	config.PortName = portName
-	
+
 	var detectedBaudRate int
 	var responseData []byte
-	
+
 	// 一般的なボーレートで試行
 	for _, baudRate := range commonBaudRates {
 		// ポートを開く
@@ -147,24 +151,24 @@ func autoNegotiate(portName string, originalConfig SerialConfig) (SerialConfig, 
 			Parity:   config.Parity,
 			StopBits: config.StopBits,
 		})
-		
+
 		if err != nil {
 			continue
 		}
-		
+
 		// 簡単なテスト（CR送信して応答を待つ）
 		_, err = port.Write([]byte{13}) // CR
 		if err != nil {
 			port.Close()
 			continue
 		}
-		
+
 		// 応答を待つ
 		buf := make([]byte, 512)
 		port.SetReadTimeout(time.Millisecond * 500)
 		n, err := port.Read(buf)
 		port.Close()
-		
+
 		if err == nil && n > 0 {
 			// 応答があればこの設定で成功
 			detectedBaudRate = baudRate
@@ -172,15 +176,15 @@ func autoNegotiate(portName string, originalConfig SerialConfig) (SerialConfig, 
 			break
 		}
 	}
-	
+
 	if detectedBaudRate == 0 {
 		// 自動ネゴシエーション失敗時はデフォルト設定を返す
 		return config, nil
 	}
-	
+
 	// ボーレートを設定
 	config.BaudRate = detectedBaudRate
-	
+
 	// エンコーディングの自動検出が有効な場合
 	if config.AutoDetectEncoding && len(responseData) > 0 {
 		detectedEncoding, detectedEncodingName := detectEncoding(responseData)
@@ -188,12 +192,38 @@ func autoNegotiate(portName string, originalConfig SerialConfig) (SerialConfig, 
 		config.EncodingName = detectedEncodingName
 		fmt.Printf("エンコーディングを自動検出: %s\n", detectedEncodingName)
 	}
-	
+
 	return config, nil
 }
 
 // シリアルポートに接続してインタラクティブモードを開始
 func connectToPort(config SerialConfig) error {
+	var logFile *os.File
+	var err error
+
+	// ログファイルが指定されている場合は開く
+	if config.LogFile != "" {
+		// ディレクトリが存在しない場合は作成
+		logDir := filepath.Dir(config.LogFile)
+		if logDir != "." {
+			if err := os.MkdirAll(logDir, 0755); err != nil {
+				return fmt.Errorf("ログディレクトリの作成に失敗しました: %v", err)
+			}
+		}
+
+		// ログファイルを開く（追記モード）
+		logFile, err = os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("ログファイルを開けませんでした: %v", err)
+		}
+		defer logFile.Close()
+
+		// ログファイルにセッション開始情報を書き込む
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		logFile.WriteString(fmt.Sprintf("\n\n===== セッション開始: %s =====\n", timestamp))
+		logFile.WriteString(fmt.Sprintf("ポート: %s, ボーレート: %d, エンコーディング: %s\n\n",
+			config.PortName, config.BaudRate, config.EncodingName))
+	}
 	// ポートを開く
 	port, err := serial.Open(config.PortName, &serial.Mode{
 		BaudRate: config.BaudRate,
@@ -201,21 +231,21 @@ func connectToPort(config SerialConfig) error {
 		Parity:   config.Parity,
 		StopBits: config.StopBits,
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("ポートを開けませんでした: %v", err)
 	}
-	
+
 	defer port.Close()
-	
+
 	// 接続情報を表示
-	fmt.Printf("\n接続しました: %s (ボーレート: %d, データビット: %d)\n", 
+	fmt.Printf("\n接続しました: %s (ボーレート: %d, データビット: %d)\n",
 		config.PortName, config.BaudRate, config.DataBits)
 	fmt.Println("終了するには Ctrl+C を押してください")
-	
+
 	// 非ブロッキングモードに設定
 	port.SetReadTimeout(time.Millisecond * 10)
-	
+
 	// ユーザー入力を処理するゴルーチン
 	go func() {
 		buf := make([]byte, 1)
@@ -224,7 +254,7 @@ func connectToPort(config SerialConfig) error {
 			if err != nil || n == 0 {
 				continue
 			}
-			
+
 			_, err = port.Write(buf[:n])
 			if err != nil {
 				log.Printf("書き込みエラー: %v", err)
@@ -232,95 +262,118 @@ func connectToPort(config SerialConfig) error {
 			}
 		}
 	}()
-	
+
 	// シリアルポートからの出力を処理
 	buf := make([]byte, 1024) // より大きなバッファを使用
 	readBuf := bytes.NewBuffer(make([]byte, 0, 1024))
-	
+
 	// 接続情報にエンコーディングを追加表示
 	fmt.Printf("エンコーディング: %s\n", config.EncodingName)
-	
+
 	// エンコーディング変換用のトランスフォーマー
 	var transformer transform.Transformer
 	if config.Encoding != encoding.Nop {
 		transformer = config.Encoding.NewDecoder()
 	}
-	
+
 	for {
 		n, err := port.Read(buf)
 		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "timeout") {
 			return fmt.Errorf("読み込みエラー: %v", err)
 		}
-		
+
 		if n > 0 {
 			// バッファに追加
 			readBuf.Write(buf[:n])
-			
+
 			// エンコーディング変換
+			var outputData []byte
 			if transformer != nil {
 				// 変換処理
 				decoded, err := io.ReadAll(transform.NewReader(readBuf, transformer))
 				if err == nil && len(decoded) > 0 {
-					os.Stdout.Write(decoded)
-					readBuf.Reset() // バッファをクリア
+					outputData = decoded
+				} else {
+					// 変換エラー時は元のバイト列を使用
+					outputData = readBuf.Bytes()
 				}
 			} else {
 				// UTF-8の場合は変換しない
-				data := readBuf.Bytes()
-				os.Stdout.Write(data)
-				readBuf.Reset() // バッファをクリア
+				outputData = readBuf.Bytes()
 			}
+
+			// 標準出力に書き込み
+			os.Stdout.Write(outputData)
+
+			// ログファイルに書き込み
+			if logFile != nil {
+				logFile.Write(outputData)
+			}
+
+			// バッファをクリア
+			readBuf.Reset()
 		}
-		
+
 		time.Sleep(time.Millisecond * 10)
 	}
 }
 
 // メイン関数
 func main() {
+	// コマンドラインオプションの解析
+	var logFilePath string
+	flag.StringVar(&logFilePath, "log", "", "ログファイルのパス（例: ./logs/session.log）")
+	flag.Parse()
+
 	// tviewアプリケーションの作成
 	app := tview.NewApplication()
-	
+
 	// 設定
 	config := DefaultConfig()
-	
+	config.LogFile = logFilePath
+
+	// ログファイルが指定されている場合は表示
+	if config.LogFile != "" {
+		fmt.Printf("ログファイル: %s\n", config.LogFile)
+	}
+
 	// 利用可能なポートを取得
 	ports, err := getAvailablePorts()
 	if err != nil {
 		log.Fatalf("ポートの列挙に失敗しました: %v", err)
 	}
-	
+
 	if len(ports) == 0 {
 		log.Fatalf("利用可能なシリアルポートが見つかりませんでした")
 	}
-	
+
 	// メインフォーム
 	form := tview.NewForm()
-	
+
 	// ポート選択リスト
 	portList := tview.NewList().
 		SetHighlightFullLine(true).
 		SetSelectedBackgroundColor(tcell.ColorBlue)
-	
+
 	for i, port := range ports {
 		portList.AddItem(port, "", rune('a'+i), nil)
 	}
-	
+
 	portList.SetSelectedFunc(func(index int, _ string, _ string, _ rune) {
 		portInfo := ports[index]
 		config.PortName = extractPortName(portInfo)
-		
+
 		// 自動ネゴシエーションが有効な場合
 		if config.AutoNegotiate {
 			app.Stop()
 			fmt.Printf("ポート %s に接続中...\n", config.PortName)
 			fmt.Println("自動ネゴシエーション中...")
-			
+
 			negotiatedConfig, err := autoNegotiate(config.PortName, config)
 			if err != nil {
 				log.Fatalf("自動ネゴシエーションに失敗しました: %v", err)
 			}
-			
+
 			err = connectToPort(negotiatedConfig)
 			if err != nil {
 				log.Fatalf("接続エラー: %v", err)
@@ -334,7 +387,7 @@ func main() {
 			}
 		}
 	})
-	
+
 	// ボーレート選択
 	baudRateDropDown := tview.NewDropDown().
 		SetLabel("ボーレート: ").
@@ -345,7 +398,7 @@ func main() {
 			config.BaudRate = baudRate
 		})
 	baudRateDropDown.SetCurrentOption(0) // デフォルトは9600
-	
+
 	// エンコーディング選択
 	encodingNames := []string{"UTF-8", "Shift-JIS", "EUC-JP", "ISO-2022-JP"}
 	encodingDropDown := tview.NewDropDown().
@@ -356,7 +409,7 @@ func main() {
 			fmt.Printf("エンコーディングを %s に設定しました\n", text)
 		})
 	encodingDropDown.SetCurrentOption(0) // デフォルトはUTF-8
-	
+
 	// 自動ネゴシエーションチェックボックス
 	autoNegotiateCheckbox := tview.NewCheckbox().
 		SetLabel("自動ネゴシエーション: ").
@@ -366,7 +419,7 @@ func main() {
 			// 自動ネゴシエーションが有効な場合、ボーレート選択を無効化
 			baudRateDropDown.SetDisabled(checked)
 		})
-		
+
 	// 自動エンコーディング検出チェックボックス
 	autoDetectEncodingCheckbox := tview.NewCheckbox().
 		SetLabel("エンコーディング自動検出: ").
@@ -376,13 +429,13 @@ func main() {
 			// 自動検出が有効な場合、エンコーディング選択を無効化
 			encodingDropDown.SetDisabled(checked)
 		})
-	
+
 	// フォームにコンポーネントを追加
 	form.AddFormItem(autoNegotiateCheckbox)
 	form.AddFormItem(autoDetectEncodingCheckbox)
 	form.AddFormItem(baudRateDropDown)
 	form.AddFormItem(encodingDropDown)
-	
+
 	// レイアウト
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
@@ -391,7 +444,7 @@ func main() {
 			SetTextColor(tcell.ColorYellow), 1, 0, false).
 		AddItem(portList, 0, 1, true).
 		AddItem(form, 4, 0, false)
-	
+
 	// アプリケーションの実行
 	if err := app.SetRoot(flex, true).EnableMouse(true).Run(); err != nil {
 		log.Fatalf("アプリケーションエラー: %v", err)
