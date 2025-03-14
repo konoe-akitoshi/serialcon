@@ -30,19 +30,21 @@ SerialConは、Mac上でネットワーク機器等のシリアルコンソー�
 
 1. リポジトリをクローン：
    ```
-   git clone https://github.com/akitoshi/serialcon.git
+   git clone https://github.com/konoe-akitoshi/serialcon.git
    cd serialcon
    ```
 
-2. ビルド：
+2. ビルドスクリプトを実行：
    ```
-   go build -o serialcon
+   ./build.sh
    ```
 
-3. 必要に応じてパスの通った場所に移動する：
+3. インストールスクリプトを実行：
    ```
-   sudo mv serialcon /usr/local/bin/
+   sudo ./install.sh
    ```
+
+これにより、バイナリがビルドされ、`/usr/local/bin/` にインストールされます。
 
 ## 使い方
 
