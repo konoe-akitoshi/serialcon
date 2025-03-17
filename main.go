@@ -29,8 +29,8 @@ var encodings = map[string]encoding.Encoding{
 	"ISO-2022-JP": japanese.ISO2022JP,
 }
 
-// 一般的なボーレート
-var commonBaudRates = []int{9600, 19200, 38400, 57600, 115200}
+// 一般的なボーレート（優先順位順）
+var commonBaudRates = []int{9600, 115200, 19200, 38400, 57600, 4800, 2400, 1200}
 
 // シリアルポート設定
 type SerialConfig struct {
@@ -139,55 +139,119 @@ func autoNegotiate(portName string, originalConfig SerialConfig) (SerialConfig, 
 	config := originalConfig
 	config.PortName = portName
 
-	var detectedBaudRate int
-	var responseData []byte
+	type baudRateScore struct {
+		baudRate int
+		score    int
+		data     []byte
+	}
 
-	// 一般的なボーレートで試行
+	var bestBaudRate baudRateScore
+
+	fmt.Println("ボーレート自動検出中...")
+
+	// 各ボーレートで複数回試行
 	for _, baudRate := range commonBaudRates {
-		// ポートを開く
-		port, err := serial.Open(portName, &serial.Mode{
-			BaudRate: baudRate,
-			DataBits: config.DataBits,
-			Parity:   config.Parity,
-			StopBits: config.StopBits,
-		})
+		fmt.Printf("  %d bps テスト中...", baudRate)
 
-		if err != nil {
-			continue
-		}
+		// このボーレートでのスコア
+		score := 0
+		var responseData []byte
 
-		// 簡単なテスト（CR送信して応答を待つ）
-		_, err = port.Write([]byte{13}) // CR
-		if err != nil {
+		// 3回試行
+		for attempt := 0; attempt < 3; attempt++ {
+			// ポートを開く
+			port, err := serial.Open(portName, &serial.Mode{
+				BaudRate: baudRate,
+				DataBits: config.DataBits,
+				Parity:   config.Parity,
+				StopBits: config.StopBits,
+			})
+
+			if err != nil {
+				continue
+			}
+
+			// テストコマンド送信（複数のコマンドを試す）
+			testCommands := [][]byte{
+				{13},         // CR
+				{13, 10},     // CR+LF
+				{27, 91, 65}, // 上矢印キー
+				{63, 13},     // ?+CR (ヘルプ)
+			}
+
+			for _, cmd := range testCommands {
+				_, err = port.Write(cmd)
+				if err != nil {
+					continue
+				}
+
+				// 応答を待つ（タイムアウトを調整）
+				buf := make([]byte, 1024)
+				port.SetReadTimeout(time.Millisecond * 300)
+				n, err := port.Read(buf)
+
+				if err == nil && n > 0 {
+					// 応答があればスコアを加算
+					score++
+
+					// 最初に応答があった場合はそのデータを保存
+					if responseData == nil {
+						responseData = make([]byte, n)
+						copy(responseData, buf[:n])
+					}
+
+					// 応答データの品質を評価
+					// プロンプト文字（>、#、$など）が含まれていればボーナススコア
+					if bytes.ContainsAny(buf[:n], ">#$:") {
+						score += 3
+					}
+
+					// 可読文字が多ければボーナススコア
+					readableChars := 0
+					for _, b := range buf[:n] {
+						if (b >= 32 && b <= 126) || b == 13 || b == 10 || b == 9 {
+							readableChars++
+						}
+					}
+					if float64(readableChars)/float64(n) > 0.7 {
+						score += 2
+					}
+				}
+			}
+
 			port.Close()
-			continue
 		}
 
-		// 応答を待つ
-		buf := make([]byte, 512)
-		port.SetReadTimeout(time.Millisecond * 500)
-		n, err := port.Read(buf)
-		port.Close()
+		// このボーレートの結果を表示
+		if score > 0 {
+			fmt.Printf(" 応答あり (スコア: %d)\n", score)
+		} else {
+			fmt.Println(" 応答なし")
+		}
 
-		if err == nil && n > 0 {
-			// 応答があればこの設定で成功
-			detectedBaudRate = baudRate
-			responseData = buf[:n]
-			break
+		// 最高スコアを更新
+		if score > bestBaudRate.score {
+			bestBaudRate = baudRateScore{
+				baudRate: baudRate,
+				score:    score,
+				data:     responseData,
+			}
 		}
 	}
 
-	if detectedBaudRate == 0 {
+	if bestBaudRate.score == 0 {
 		// 自動ネゴシエーション失敗時はデフォルト設定を返す
+		fmt.Println("自動ネゴシエーション失敗: デフォルト設定を使用します")
 		return config, nil
 	}
 
-	// ボーレートを設定
-	config.BaudRate = detectedBaudRate
+	// 最適なボーレートを設定
+	config.BaudRate = bestBaudRate.baudRate
+	fmt.Printf("最適なボーレート: %d bps (スコア: %d)\n", bestBaudRate.baudRate, bestBaudRate.score)
 
 	// エンコーディングの自動検出が有効な場合
-	if config.AutoDetectEncoding && len(responseData) > 0 {
-		detectedEncoding, detectedEncodingName := detectEncoding(responseData)
+	if config.AutoDetectEncoding && bestBaudRate.data != nil && len(bestBaudRate.data) > 0 {
+		detectedEncoding, detectedEncodingName := detectEncoding(bestBaudRate.data)
 		config.Encoding = detectedEncoding
 		config.EncodingName = detectedEncodingName
 		fmt.Printf("エンコーディングを自動検出: %s\n", detectedEncodingName)
